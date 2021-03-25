@@ -30,6 +30,10 @@
 #include "scull.h"		/* local definitions */
 #include "access_ok_version.h"
 
+
+#include <linux/sched.h>	// access current task info
+#include <linux/mutex.h>	// lock linked list operations
+
 /*
  * Our parameters which can be set at load time.
  */
@@ -47,6 +51,75 @@ MODULE_LICENSE("Dual BSD/GPL");
 
 static struct cdev scull_cdev;		/* Char device structure		*/
 
+
+// create task_info struct
+static task_info ti;
+
+// create linked list for task pids/tgids
+static node *list;
+int list_size = 0;
+
+// create mutex lock for linked list operations
+static DEFINE_MUTEX(list_lock);
+
+// push function for linked list
+void list_push(pid_t pid, pid_t tgid) {
+	node *curr = list;
+	node *temp = (node*)kmalloc(sizeof(node), GFP_KERNEL);	
+
+	temp->pid = pid;
+	temp->tgid = tgid;
+	temp->next = NULL;
+
+	if (list == NULL) {
+		list = temp;
+	} else {
+		while (curr->next != NULL) {
+			curr = curr->next;
+		}
+		curr->next = temp;
+	}
+	list_size++;
+}
+
+// contains function for pid in linked list
+bool list_contains(pid_t pid, pid_t tgid) {
+	node *curr = list;
+
+	while(curr != NULL) {
+		if (curr->pid == pid && curr->tgid == tgid) {
+			return true;
+		}
+		curr = curr->next;
+	}
+
+	return false;
+}
+
+// print function for linked list
+void list_print(void) {
+	node *curr = list;
+	int counter = 1;
+
+	printk(KERN_INFO "Linked List to be deleted: \n");
+	
+	while(curr != NULL) {
+		if (counter < list_size) {
+			printk(KERN_INFO "Task %d: PID: %ld; TGID: %ld ->\n",
+				counter,
+				(long)curr->pid,
+				(long)curr->tgid);
+		} else {
+			printk(KERN_INFO "Task %d: PID: %ld; TGID: %ld\n",
+				counter,
+				(long)curr->pid,
+				(long)curr->tgid);
+		}	
+		
+		curr = curr->next;
+		counter++;
+	}
+}
 
 /*
  * Open and close
@@ -71,10 +144,9 @@ static int scull_release(struct inode *inode, struct file *filp)
 static long scull_ioctl(struct file *filp, unsigned int cmd,
 		unsigned long arg)
 {
-
 	int err = 0, tmp;
 	int retval = 0;
-    
+	
 	/*
 	 * extract the type and number bitfields, and don't decode
 	 * wrong cmds: return ENOTTY (inappropriate ioctl) before access_ok()
@@ -86,7 +158,7 @@ static long scull_ioctl(struct file *filp, unsigned int cmd,
 	 * the direction is a bitmask, and VERIFY_WRITE catches R/W
 	 * transfers. `Type' is user-oriented, while
 	 * access_ok is kernel-oriented, so the concept of "read" and
-	 * "write" is reversed
+	 * "write" is reverse
 	 */
 	if (_IOC_DIR(cmd) & _IOC_READ)
 		err = !access_ok_wrapper(VERIFY_WRITE, (void __user *)arg,
@@ -128,10 +200,36 @@ static long scull_ioctl(struct file *filp, unsigned int cmd,
 		tmp = scull_quantum;
 		scull_quantum = arg;
 		return tmp;
+	
+	case SCULL_IOCKQUANTUM: /* copy task info to user */
+		// populate struct with data
+		ti.state = current->state;
+		ti.stack = current->stack;
+		ti.cpu = current->cpu;
+		ti.prio = current->prio;
+		ti.static_prio = current->static_prio;
+		ti.normal_prio = current->normal_prio;
+		ti.rt_priority = current->rt_priority;
+		ti.pid = current->pid;
+		ti.tgid = current->tgid;
+		ti.nvcsw = current->nvcsw;
+		ti.nivcsw = current->nivcsw;
 
-	  default:  /* redundant, as cmd was checked against MAXNR */
+		// add pid/tgid to linked list
+		mutex_lock(&list_lock);
+		if (!list_contains(ti.pid, ti.tgid)) {
+			list_push(ti.pid, ti.tgid);
+		}
+		mutex_unlock(&list_lock);
+
+		// copy struct to user
+		retval = __copy_to_user((task_info __user *) arg, &ti, sizeof(task_info));
+		break;
+	
+	default:  /* redundant, as cmd was checked against MAXNR */
 		return -ENOTTY;
 	}
+
 	return retval;
 
 }
@@ -155,10 +253,21 @@ struct file_operations scull_fops = {
  */
 void scull_cleanup_module(void)
 {
+	node *temp;
 	dev_t devno = MKDEV(scull_major, scull_minor);
 
 	/* Get rid of the char dev entry */
 	cdev_del(&scull_cdev);
+
+	// print linked list items
+	list_print();
+
+	// destroy linked list
+	while (list != NULL) {
+		temp = list;
+		list = list->next;
+		kfree(temp);
+	}	
 
 	/* cleanup_module is never called if registering failed */
 	unregister_chrdev_region(devno, 1);
@@ -169,6 +278,9 @@ int scull_init_module(void)
 {
 	int result;
 	dev_t dev = 0;
+
+	// initialize linked list
+	list = NULL;
 
 	/*
 	 * Get a range of minor numbers to work with, asking for a dynamic

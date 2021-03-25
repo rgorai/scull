@@ -1,4 +1,4 @@
-CFLAGS=-O2 -Wall -I../driver
+CFLAGS=-O2 -Wall -I../driver -lpthread
 TGT=scull
 
 
